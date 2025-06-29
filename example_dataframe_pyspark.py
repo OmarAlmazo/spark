@@ -12,6 +12,29 @@ import pyspark.sql.functions as F
 from pyspark.sql.functions import *
 from pyspark.sql.functions import col, count
 
+
+################################################################################################
+                            ####### filter vs Where ###########
+# La buena noticia es que filter() y where() son exactamente lo mismo en PySpark.
+# recordar que filter y where son con minusculas
+df_F_col = df.where(F.col("age") == 25)
+df_F_col = df.filter(F.col("age") == 25)
+
+
+################################################################################################
+                        ###########Catalyst#############
+# Nativa de Spark SQL: when().otherwise() es una función de PySpark que se traduce directamente a operaciones 
+# nativas en la JVM de Spark. Esto significa que Spark puede optimizarla internamente usando su motor Catalyst.
+# No hay overhead de serialización: A diferencia de las UDFs de Python, no hay necesidad de serializar y 
+# deserializar datos entre la JVM y el proceso de Python, lo que elimina una importante penalización de rendimiento.
+
+Para mapeos pequeños/medianos: Usa when().otherwise(). Es la más eficiente y clara para esos casos.
+
+Para mapeos grandes: Considera un join con un DataFrame que contenga tu tabla de mapeo. Es la solución más escalable.
+
+Para lógica muy compleja o si el rendimiento no es crítico: Usa UDFs de Python como último recurso.
+
+
 ################################################################################################
 ## filtrar la data tan pronto como sea posible (As Early As Possible - AEAP).
 #Spark has a smart optimizer called Catalyst Optimizer. When you apply a filter, 
@@ -27,14 +50,14 @@ df = (
           .groupBy(<Nombre de columna>)
           .agg(
               F.countDistinct("id").alias("conteo_id"),
-              F.count("*").alias("total_count"),
+              F.count("*").alias("total_count"), # el total de registros por grupo
               F.sum("monto_1").alias("suma_monto_1"),
               F.sum("monto_2").alias("suma_monto_2")
           )
 ).show()
 
 #Filter con varias columnas 
-df.filter(col(<nombre_columna>).isin([<valor_1>,<valor_2>,<valor_3>])).orderBy(<nombre_columna>, ascending=True).show()
+df.filter(F.col(<nombre_columna>).isin([<valor_1>,<valor_2>,<valor_3>])).orderBy(<nombre_columna>, ascending=True).show()
 
 ################################################################################################
 # Así es, no puedes ver el contenido de df directamente si solo se usa el groupBy se necesita de un count o funciones de 
@@ -100,7 +123,7 @@ sub_numeros = numeros[1:3]  # [5, 8]
 **
 # List Comprehension
 # x**2 significa que multiplicara el mismo numero por sí mismo (elevar al cuadrado).
-# Por ejemplo, si x es 3, entonces x**2 es 9   3x3 = 9 .
+# Por ejemplo, si x es 3, entonces x**2 es 9   3x3 = 9 . si tienes 3 a la 3 3*3*3 = 27
 cuadrados = [x**2 for x in range(1, 6)]
 cuadrados = [1, 4, 9, 16, 25]
 
@@ -120,6 +143,8 @@ schema = StructType([
     StructField("edad", IntegerType(), True)
 ])
 
+################################################################################################
+
 # drop normalmente se usa para eliminar columnas de un DataFrame en PySpark.
 df.drop('columna_a', 'columna_b') # Puedes pasar argumentos separados
 #Drop dinámico de columnas desempaquetadas
@@ -129,6 +154,7 @@ df.drop('columna_a', 'columna_b') # Puedes pasar argumentos separados
 columnas_dinamicas_a_eliminar = ['columna_z', 'columna_x'] # Esta lista podría venir de algún cálculo
 df_modificado = df.drop(*columnas_dinamicas_a_eliminar)
 
+################################################################################################
 
 # Definir las particiones de un DataFrame en PySpark
 # Puedes definir las particiones de un DataFrame utilizando el método repartition().
@@ -167,6 +193,165 @@ range(1, 6)
 {'id_col': 'id', 'count_col': 'conteo_id'}
 
 
+################################################################################################
+# Las UDFs pueden incurrir en una penalización de rendimiento porque implican serializar y deserializar
+# datos entre la JVM (donde corre Spark) y el proceso de Python. Siempre es preferible usar funciones nativas de 
+# Spark SQL cuando sea posible, ya que están altamente optimizadas.
+
+
+# Mapear o transformar datos: Usar diccionarios como tablas de búsqueda dentro de funciones 
+# UDF (User Defined Functions) o transformaciones withColumn y map.
+
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import col, udf
+from pyspark.sql.types import StringType
+
+# 1. Iniciar una sesión de Spark
+spark = SparkSession.builder \
+    .appName("MapeoConDiccionarioUDF") \
+    .getOrCreate()
+
+# 2. Crear un DataFrame de ejemplo
+# Tenemos una columna 'codigo_producto' que queremos mapear a una categoría
+data = [
+    ("PROD001", 100),
+    ("PROD002", 150),
+    ("PROD003", 200),
+    ("PROD004", 50),
+    ("PROD005", 250),
+    ("PROD006", 120)
+]
+columns = ["codigo_producto", "ventas"]
+df = spark.createDataFrame(data, columns)
+
+print("--- DataFrame Original ---")
+df.show()
+# Salida de df.show() para el DataFrame Original:
+# +---------------+------+
+# |codigo_producto|ventas|
+# +---------------+------+
+# |        PROD001|   100|
+# |        PROD002|   150|
+# |        PROD003|   200|
+# |        PROD004|    50|
+# |        PROD005|   250|
+# |        PROD006|   120|
+# +---------------+------+
+
+df.printSchema()
+# Salida de df.printSchema() para el DataFrame Original:
+# root
+#  |-- codigo_producto: string (nullable = true)
+#  |-- ventas: long (nullable = true)
+
+# 3. Definir el diccionario de mapeo
+# Las claves son los códigos de producto y los valores son las categorías
+# Puedes tener un valor por defecto para códigos no encontrados
+mapeo_categorias = {
+    "PROD001": "Electrónica",
+    "PROD002": "Electrodomésticos",
+    "PROD003": "Muebles",
+    "PROD004": "Ropa",
+    # Si un código no está en el diccionario, podemos darle una categoría por defecto
+    "DEFAULT": "Desconocido"
+}
+
+# 4. Crear una función Python para el mapeo
+# Esta función tomará un código de producto y devolverá su categoría
+def obtener_categoria(codigo):
+    # Usamos .get() para poder especificar un valor por defecto si la clave no existe
+    return mapeo_categorias.get(codigo, mapeo_categorias["DEFAULT"])
+
+# 5. Registrar la función Python como una UDF (User Defined Function) en Spark
+# Le decimos a Spark que la UDF tomará un String y devolverá un String
+categoria_udf = udf(obtener_categoria, StringType())
+
+# 6. Usar la UDF con withColumn para agregar la nueva columna
+df_con_categorias = df.withColumn(
+    "categoria_producto",
+    categoria_udf(col("codigo_producto")) # Aplicamos la UDF a la columna 'codigo_producto'
+)
+
+print("\n--- DataFrame con Nueva Columna de Categoría ---")
+df_con_categorias.show()
+# Salida de df_con_categorias.show():
+# +---------------+------+-------------------+
+# |codigo_producto|ventas|categoria_producto |
+# +---------------+------+-------------------+
+# |        PROD001|   100|        Electrónica|
+# |        PROD002|   150|  Electrodomésticos|
+# |        PROD003|   200|            Muebles|
+# |        PROD004|    50|                 Ropa|
+# |        PROD005|   250|        Desconocido|
+# |        PROD006|   120|        Desconocido|
+# +---------------+------+-------------------+
+
+df_con_categorias.printSchema()
+# Salida de df_con_categorias.printSchema():
+# root
+#  |-- codigo_producto: string (nullable = true)
+#  |-- ventas: long (nullable = true)
+#  |-- categoria_producto: string (nullable = true)
+
+# Otro ejemplo: Agregando un código no mapeado para ver el 'DEFAULT'
+data_b = [
+    ("PROD001", 100),
+    ("PROD007", 150), # Este código no está en el diccionario
+    ("PROD003", 200)
+]
+df_b = spark.createDataFrame(data_b, columns)
+
+df_b_con_categorias = df_b.withColumn(
+    "categoria_producto",
+    categoria_udf(col("codigo_producto"))
+)
+
+print("\n--- DataFrame con un código no mapeado (usando DEFAULT) ---")
+df_b_con_categorias.show()
+# Salida de df_b_con_categorias.show():
+# +---------------+------+-------------------+
+# |codigo_producto|ventas|categoria_producto |
+# +---------------+------+-------------------+
+# |        PROD001|   100|        Electrónica|
+# |        PROD007|   150|        Desconocido|
+# |        PROD003|   200|            Muebles|
+# +---------------+------+-------------------+
+
+
+# 7. Detener la sesión de Spark
+spark.stop()
+
+################################################################################################
+# Combina lista con diccionarios
+# Crear DataFrames a partir de una lista de diccionarios: Cada diccionario representa una fila y las 
+# claves del diccionario se convierten en los nombres de las columnas.
+# Así que, en esencia, tienes una colección de "registros" (cada uno un diccionario), 
+# y esa colección completa está organizada como una lista. Es una estructura de datos muy 
+# común y potente en Python para manejar conjuntos de datos estructurados
+#Llaves {} para cada diccionario: Dentro de esa lista, cada elemento individual es un diccionario, 
+# encerrado en llaves {}. Cada uno de estos diccionarios representa un objeto o entidad,
+
+data = [
+    {"nombre": "Alice", "edad": 30, "ciudad": "Nueva York"},
+    {"nombre": "Bob", "edad": 24, "ciudad": "Londres"},
+    {"nombre": "Charlie", "edad": 35, "ciudad": "París"},
+    {"nombre": "David", "edad": 29, "ciudad": "Nueva York"}
+]
+
+# Para obtener el primer diccionario de la lista
+primer_persona = data[0]
+print(f"El primer diccionario es: {primer_persona}")
+# Output: El primer diccionario es: {'nombre': 'Alice', 'edad': 30, 'ciudad': 'Nueva York'}
+
+# Para obtener el nombre de la primera persona
+nombre_primera_persona = data[0]["nombre"]
+print(f"El nombre de la primera persona es: {nombre_primera_persona}")
+# Output: El nombre de la primera persona es: Alice
+
+# Para obtener la edad de la segunda persona
+edad_segunda_persona = data[1]["edad"]
+print(f"La edad de la segunda persona es: {edad_segunda_persona}")
+# Output: La edad de la segunda persona es: 24
 ################################################################################################
 # Eso es una tupla en Python.
 # Una tupla es una colección ordenada e inmutable de elementos.
